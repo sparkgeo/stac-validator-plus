@@ -8,6 +8,10 @@ dependencies = [
     "jinja2~=3.1.6",
     "httpx~=0.28.1",
     "fsspec~=2026.3.0",
+    "stac-validator~=4.1.0",
+    "stac-check~=1.14.0",
+    "pystac~=1.14.3",
+    "pydantic~=2.12.5",
 ]
 
 [project.optional-dependencies]
