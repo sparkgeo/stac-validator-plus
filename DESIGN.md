@@ -275,7 +275,7 @@ stac-validator-plus <ITEM>            # file path or URL
 
 (`--max-turns` is gone — there is no agentic loop in a plain Bedrock Messages call.)
 
-Built with `rich-click` (existing `cli` extra). `api.py` stays as a minimal stub for V2.
+Built with `rich-click` (existing `cli` extra).
 
 ## 11. Configuration
 
@@ -309,7 +309,6 @@ Built with `rich-click` (existing `cli` extra). `api.py` stays as a minimal stub
 src/stac_validator_plus/
   __init__.py  __main__.py
   cli.py                     # rich-click entrypoint
-  api.py                     # minimal FastAPI stub (V2)
   config.py                  # tomllib load + flag override → Settings
   models.py                  # Finding, Reference, ValidationReport, enums (Pydantic)
   pipeline.py                # orchestrates gate → checks → claude → merge → render

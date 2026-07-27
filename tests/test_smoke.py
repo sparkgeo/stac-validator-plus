@@ -1,9 +1,7 @@
 """Smoke tests: the package and its module layout import cleanly.
 
 This validates the scaffolding from issue #1 — every stub module in the
-``DESIGN.md`` §13 layout is importable. The optional ``api`` extra
-(``stac_validator_plus.api``) is intentionally excluded so the core package
-does not depend on FastAPI being installed.
+``DESIGN.md`` §13 layout is importable.
 """
 
 import importlib

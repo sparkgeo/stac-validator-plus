@@ -24,7 +24,7 @@ jobs:
         run: uv python install 3.14
 
       - name: Sync dependencies
-        run: uv sync --extra api --group dev --frozen
+        run: uv sync --group dev --frozen
 
       - name: Lint
         run: uv run ruff check .
