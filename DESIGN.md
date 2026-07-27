@@ -2,6 +2,8 @@
 
 **Status:** Draft for implementation · **Date:** 2026-07-23 · **Author:** John Donovan (jdonovan@sparkgeo.com)
 
+**Revised 2026-07-27:** LLM backend changed from headless `claude -p` to **AWS Bedrock** (see §8 and the ripples in §10–14, §16–17). Reason: operational problems running Claude headless. Everything upstream of the Claude stage (gate, deterministic checks, plugins, the `Finding` model) is unchanged.
+
 ## 1. Purpose
 
 Combine deterministic Python STAC validation (from `../eodh-validator`) with LLM-based
@@ -34,31 +36,26 @@ does exactly (schema conformance, mechanical lint), and let Claude do what code 
 
 ## 3. Pipeline architecture
 
-```
-        ┌──────────────┐
-input → │ 0. Load+Gate │ ── fatal? ──→ validation-only report (skip Claude)
-        └──────┬───────┘
-               │ passes
-        ┌──────▼───────────────────────────┐
-        │ 1. Deterministic Python checks    │   (parallel-safe, pure)
-        │   • stac-validator (schema)       │
-        │   • stac-check Linter (lint)      │
-        │   • registered plugins (heuristic)│
-        └──────┬────────────────────────────┘
-               │ deterministic Findings
-        ┌──────▼────────────────────────────┐
-        │ 2. Claude stage (Python-driven)    │
-        │   examine × N (given known         │
-        │   findings, told to find OTHERS)   │
-        │   → dedup (if N>1) → categorize    │
-        └──────┬────────────────────────────┘
-               │ Claude Findings
-        ┌──────▼───────┐
-        │ 3. Merge      │  deterministic + Claude → single Finding list
-        └──────┬───────┘
-        ┌──────▼───────┐
-        │ 4. Render     │  JSON (canonical) → Jinja2 → Markdown
-        └──────────────┘
+```mermaid
+flowchart TD
+    input([STAC Item — file or URL]) --> gate
+
+    gate["<b>0. Load + Gate</b><br/>parse JSON, build pystac.Item"]
+    gate -->|"fatal: not JSON, or not a STAC Item"| gated["validation-only Findings<br/>(Claude skipped)"]
+    gate -->|passes| checks
+
+    checks["<b>1. Deterministic Python checks</b> — parallel-safe, pure<br/>• stac-validator (schema)<br/>• stac-check Linter (lint)<br/>• registered plugins (heuristic)"]
+    checks -->|deterministic Findings| claude
+
+    claude["<b>2. Claude via Bedrock</b> — Python-driven<br/>examine × N: Item + known findings + cached doc bundle → find OTHERS<br/>→ dedup (N&gt;1) → categorize → verify reference URLs"]
+    claude -->|Claude Findings| merge
+
+    merge["<b>3. Merge</b><br/>deterministic + Claude → single Finding list"]
+    merge --> render
+
+    gated --> render
+    render["<b>4. Render</b><br/>JSON (canonical) → Jinja2 → Markdown"]
+    render --> report([Markdown report])
 ```
 
 Python is the orchestrator of the whole pipeline; the Claude sub-orchestration
@@ -94,6 +91,11 @@ class Finding(BaseModel):
     message: str                    # human-worded; field/property names in back-ticks
     json_path: str | None = None    # e.g. "properties.sar:instrument_mode"
     references: list[Reference] = []
+
+class UsageSummary(BaseModel):
+    tokens: int
+    cost: float
+    model: str
 
 class ValidationReport(BaseModel):
     item_id: str
@@ -166,45 +168,82 @@ For pragmatic, seen-in-the-wild checks with tailored messages, kept out of the c
 - Plugins are **toggleable by name** in config (disable noisy ones per catalog).
 - Plugin findings feed both the report and the "already known" set injected into Claude.
 
-## 8. Stage 2 — Claude (headless `claude -p`, Python-orchestrated)
+## 8. Stage 2 — Claude via AWS Bedrock (Python-orchestrated)
+
+> **Backend change (2026-07-27).** The LLM stage now calls **AWS Bedrock** instead of a
+> headless `claude -p` subprocess. This removes the "authenticated `claude` CLI on the
+> host" ops constraint, but also removes the agentic **WebFetch** loop the headless CLI
+> gave us — a plain Bedrock Messages call has no web access. Doc grounding is therefore
+> re-designed (see *Doc grounding* below). Python still owns the whole pipeline and the
+> LLM sub-orchestration (examine → dedup → categorize).
 
 ### Invocation
-- Runs `claude -p` as a **subprocess** (Enterprise seat login — **no API key**).
-- **Ops constraint:** any host running this must have an authenticated `claude` CLI.
-- `--output-format json` (session metadata wrapping a free-text `result`).
-- `--allowedTools WebFetch` restricted to STAC domains: `github.com`,
-  `raw.githubusercontent.com`, `stac-extensions.github.io` — keeps the doc-restricted,
-  cite-your-sources behaviour from `claude-stac-validator`.
-- Structured output: prompt hard for JSON, then **validate with Pydantic**, retrying the
-  call a small capped number of times on parse/validation failure.
-- **Output extraction (defensive):** headless Claude may wrap the JSON in prose or in a
-  ```` ```json ```` fence even when told not to. Before Pydantic validation, `runner.py`
-  extracts the JSON payload: take `result` from the `--output-format json` envelope, strip
-  any surrounding markdown fences, and if it still isn't parseable, scan for the outermost
-  balanced `{...}` block. Only then validate; a failure here counts against the retry cap.
+- **Bedrock via the `anthropic[bedrock]` SDK** (`AnthropicBedrock` client) — keeps the
+  Messages API shape, so the prompt/orchestration logic is provider-shaped, not `boto3`
+  plumbing. Region is required.
+- **Auth:** standard AWS credential chain (IAM role / env / SSO **profile**) + **Bedrock
+  model access enabled** in the account/region. This replaces the headless-CLI login
+  constraint (better fit for the eventual FastAPI service).
+- **Model IDs carry the `anthropic.` prefix** on Bedrock — e.g.
+  `anthropic.claude-sonnet-5` (default), `anthropic.claude-opus-4-8` (optional). Passed
+  explicitly on every call for reproducibility.
+- **Structured output via forced/strict tool-use.** Define a single output tool whose
+  schema is the `Finding` list and force it with `tool_choice`; the tool call returns
+  schema-valid JSON directly. Pydantic re-validates as a backstop, with a small capped
+  retry on mismatch. This **replaces the fragile headless "prompt-for-JSON → strip fences →
+  balanced-brace extraction"** dance entirely — most of the old issue #9 risk disappears.
+
+### Doc grounding (cached bundle + citations + URL verification)
+Replaces the lost WebFetch loop. Claude is *given* the relevant docs rather than fetching
+them:
+
+- **Targeted bundle.** For each Item, assemble: the core STAC spec + best-practices docs,
+  plus the README for every extension that is **declared *or* used**. Used-but-undeclared
+  extensions are found by scanning property namespaces (`sar:`, `proj:`, …) and mapping the
+  prefixes via `extensions.json` — **the same prefix-extraction logic the extension
+  plugin (§7) already implements**, shared, not duplicated. This deliberately catches the
+  common "extension used without being declared" case; Claude's strong prior on the core
+  spec covers anything the mapping misses.
+- **Delivered as a cached prefix.** The bundle is sent as inline content blocks with an
+  explicit `cache_control` breakpoint. Bedrock has **no Files API and no archive upload**,
+  so docs are inlined each request; but Bedrock **prompt caching** means the stable bundle
+  is written once (~1.25×/2×) and read at **~0.1×** across the `examine_runs` passes (and,
+  in V2, across many items within the cache TTL). *Automatic* caching is unavailable on
+  Bedrock — breakpoints are placed **manually** (max 4).
+- **Citations.** Bedrock supports document citations; grounded citations map straight into
+  the `Reference` model.
+- **Deterministic URL verification (backstop).** Every reference URL Claude emits is checked
+  in Python (HEAD/GET against the STAC-domain allowlist); unresolved / hallucinated links
+  are dropped or flagged. This absorbs the old `VALIDATE_PROMPT` "ensure links exist"
+  instruction into deterministic code.
+- **Docs are pre-downloaded package data** (`data/docs/`), refreshed offline like
+  `extensions.json` — **never** fetched at validation time.
 
 ### Orchestration (`backend/claude/orchestrator.py`)
 1. **Examine × N** (`examine_runs`, default low, configurable — the main cost lever).
-   Each run is given the Item **and** the deterministic findings, told *"these are already
-   known; find **other** issues."* Runs bounded by `max_concurrent`.
+   Each run is given the Item, the deterministic findings, and the **cached doc bundle**,
+   told *"these issues are already known; find **other** issues."* Bounded by `max_concurrent`.
    - **Compact injection:** the known findings are injected in a **stripped-down form —
-     `message` + `json_path` only, not full `references`** — because they are repeated on
-     *every* parallel examine pass and full reference lists would multiply token cost with
-     no analytical benefit (Claude only needs to know *what* is already covered, not its
-     citations). The full findings are still preserved for the report.
+     `message` + `json_path` only, not full `references`** — because they repeat on *every*
+     parallel examine pass and full reference lists would multiply token cost with no
+     analytical benefit. The full findings are still preserved for the report. (The doc
+     bundle, by contrast, is identical across passes and rides the prompt cache.)
 2. **Dedup** — only when `N > 1`; merge semantically equivalent issues, keep best wording,
    union references.
 3. **Categorize** — group Claude's net-new findings into `core` / `best-practice` /
    `extension`.
+4. **Verify reference URLs** — deterministic link check (above); prune dead links.
 
-Prompt text and JSON schemas are **lifted from `claude-stac-validator/stac-review.js`**
+Prompt text and schemas are **lifted from `claude-stac-validator/stac-review.js`**
 (`EXAMINE_PROMPT`, `DEDUP_PROMPT`, `VALIDATE_PROMPT`) into `backend/claude/prompts.py`,
-adapted to (a) receive known findings and (b) emit the `Finding` shape.
+adapted to (a) receive known findings, (b) emit the `Finding` shape via the forced output
+tool, and (c) point the "answer only from the docs" instruction at the **supplied bundle**
+rather than at repos to fetch.
 
 ### Model
-- **Default: Sonnet**, passed explicitly to every call for reproducibility.
-- **Opus optional** via config/flag. Rationale: moving most mechanical work into Python
-  may leave Sonnet sufficient for semantics; revisit the default if not.
+- **Default: `anthropic.claude-sonnet-5`.** **Opus (`anthropic.claude-opus-4-8`) optional**
+  via config/flag. Rationale unchanged: moving most mechanical work into Python may leave
+  Sonnet sufficient for semantics; revisit if not.
 
 ## 9. Stages 3–4 — Merge & render
 
@@ -224,15 +263,17 @@ stac-validator-plus <ITEM>            # file path or URL
   -o, --output PATH                   # write report to file/dir (auto-name in a dir); default stdout
       --json                          # also emit the raw canonical JSON
       --config PATH                   # config file (default: ./stac-validator-plus.toml)
-      --model {sonnet|opus|<id>}      # override model
+      --model {sonnet|opus|<id>}      # maps to a Bedrock model ID (anthropic.claude-*)
+      --region NAME                   # AWS region for Bedrock (else AWS_REGION / config)
       --examine-runs N                # fan-out count
-      --max-turns N                   # per claude -p call
-      --timeout SECONDS               # per subprocess
-      --max-concurrent N              # concurrent claude subprocesses
+      --timeout SECONDS               # per Bedrock request
+      --max-concurrent N              # concurrent Bedrock requests
       --no-plugin NAME / --no-check NAME
       --wall-clock-budget SECONDS     # abort run (best-effort)
-      --token-budget N                # abort between stages when exceeded (best-effort)
+      --token-budget N                # abort between calls when exceeded
 ```
+
+(`--max-turns` is gone — there is no agentic loop in a plain Bedrock Messages call.)
 
 Built with `rich-click` (existing `cli` extra). `api.py` stays as a minimal stub for V2.
 
@@ -240,21 +281,27 @@ Built with `rich-click` (existing `cli` extra). `api.py` stays as a minimal stub
 
 - **File:** `stac-validator-plus.toml` (CWD or `--config`), parsed with stdlib `tomllib`
   (no YAML dep). CLI flags override file values per run.
-- **Settings model** (Pydantic): `model`, `examine_runs`, `max_turns`,
-  `subprocess_timeout`, `max_concurrent`, `wall_clock_budget`, `token_budget`,
-  `enabled_plugins`, `enabled_checkers`, `webfetch_allowlist`.
+- **Settings model** (Pydantic): `model` (Bedrock ID), `region`, `aws_profile`,
+  `examine_runs`, `request_timeout`, `max_concurrent`, `cache_ttl` (`5m`/`1h`),
+  `bundle_docs` (on/off), `wall_clock_budget`, `token_budget`, `enabled_plugins`,
+  `enabled_checkers`, `reference_url_allowlist` (STAC domains for link verification).
 
 ## 12. Credit / time guardrails
 
 - `examine_runs` — primary cost lever (dial to 1 for cheap, up for thorough).
-- `--max-turns` — caps each agentic loop / runaway doc-fetching.
-- Per-subprocess **timeout** — kill hung calls.
-- `max_concurrent` — cap simultaneous subprocesses.
+- **Prompt caching** — the doc bundle is a cached prefix, so re-injecting it across the
+  `examine_runs` passes (and, in V2, across items) reads at ~0.1× instead of full price.
+  The single biggest structural cost saver now that docs are inlined.
+- Per-request **timeout** — kill hung calls.
+- `max_concurrent` — cap simultaneous Bedrock requests.
 - **Wall-clock budget** — overall timer; abort remaining stages.
-- **Token/cost budget** — *best-effort*: not enforceable within a single `claude -p` call,
-  but the orchestrator accumulates usage from each `--output-format json` response and
-  aborts **before the next stage** once exceeded. Honest caveat stated to users.
-- Fallback per author: manually tune prompts to balance cost vs detail.
+- **Token/cost budget** — now **precise between calls**: each Bedrock response reports exact
+  input/output/cache token counts, so the orchestrator accumulates real usage and aborts
+  before the next call once the budget is hit. (Still not a mid-call hard cap — `max_tokens`
+  bounds a single response.) **Cost** is *derived* by us (token counts × configured
+  per-token Bedrock rates); the API does not return a dollar figure — actual spend is AWS
+  billing, out of band.
+- Fallback per author: manually tune prompts / `examine_runs` to balance cost vs detail.
 
 ## 13. Proposed module layout
 
@@ -276,19 +323,22 @@ src/stac_validator_plus/
       __init__.py            # @register registry, PluginContext, discovery
       extensions.py          # ported extension heuristics (first plugin)
     claude/
-      runner.py              # subprocess claude -p, json output, timeout, retry, usage
-      orchestrator.py        # examine fan-out → dedup → categorize
+      runner.py              # AnthropicBedrock client: messages + forced-tool output + usage + retry
+      orchestrator.py        # examine fan-out → dedup → categorize → verify URLs
+      docs.py                # select (declared+used) + load cached doc bundle; shares prefix logic w/ §7
       prompts.py             # prompt templates lifted from stac-review.js
   report/
     render.py                # Jinja2
     templates/report.md.jinja2
   data/
     extensions.json          # pre-built package data
+    docs/                    # pre-downloaded STAC spec + extension READMEs (offline-refreshed)
 ```
 
 ## 14. Dependencies
 
-Add to `pyproject.toml`: `stac-validator`, `stac-check`, `pystac`, `pydantic`.
+Add to `pyproject.toml`: `stac-validator`, `stac-check`, `pystac`, `pydantic`, and
+**`anthropic[bedrock]`** (pulls `boto3` transitively for the AWS credential chain).
 Already present: `pystac-client`, `jinja2`, `httpx`, `fsspec`, `loguru`; `rich-click`
 (cli extra). Dev: `pytest`, `ruff` (present).
 
@@ -307,7 +357,12 @@ Already present: `pystac-client`, `jinja2`, `httpx`, `fsspec`, `loguru`; `rich-c
   token and DroneDB admin credentials — these must be scrubbed and rotated (tracked
   separately; not carried into this project). This tool takes auth for remote fetches via
   env/config only.
-- WebFetch is restricted to the STAC documentation domain allowlist.
+- **Bedrock auth via the AWS credential chain** (IAM role / SSO profile / env) — no API key
+  or long-lived secret committed. **Ops constraint:** the host needs AWS credentials and
+  **Bedrock model access enabled** for the chosen models in the region. Least-privilege
+  IAM: only `bedrock:InvokeModel` (± the streaming variant) on the specific model ARNs.
+- Reference-URL verification is restricted to the STAC-domain allowlist; bundled docs are
+  shipped offline (no fetch at validation time).
 - Plugins execute in-process — keep them in-tree and reviewed (a reason the registry is
   explicit, not a directory scan of arbitrary files).
 
@@ -316,5 +371,11 @@ Already present: `pystac-client`, `jinja2`, `httpx`, `fsspec`, `loguru`; `rich-c
 - V2 recursion strategy (sampling one Item per collection vs all).
 - V2 async FastAPI job model once per-run time/cost is measured.
 - Whether Sonnet's semantic recall is sufficient or Opus should become the default.
-- Periodic refresh cadence and CI for the shipped `extensions.json`.
+- Periodic refresh cadence and CI for the shipped `extensions.json` **and `data/docs/`**.
+- Doc-bundle scope: targeted (declared+used) for v1 single-Item; revisit widening to the
+  **full corpus** for V2 batch runs, where prompt caching amortises the big prefix.
+- Prompt-cache TTL tuning: `5m` is enough for one Item's `examine_runs`; `1h` likely pays
+  off for V2 batch sweeps.
+- Whether the model's training-knowledge grounding + citations makes the targeted bundle
+  worth its token cost, or a lighter "cite-from-knowledge + verify URLs" mode suffices.
 ```
